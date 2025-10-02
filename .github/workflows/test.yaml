@@ -62,7 +62,7 @@ jobs:
         run: pip cache purge
       - name: Test with pytest
         run: |
-          export XFORMERS_DISABLED=1
+          pip install --pre -U xformers
           pytest -s --cov=terratorch -v --cov-report term-missing tests
 
 
