@@ -93,8 +93,9 @@ class SegmentationIOProcessor(IOProcessor):
             meta: dict with meta info.
         """
         if out_format == "path":
-
+            print(f"Outputing to a path")
             if out_path:
+                print(f"Given path: {out_path}")
                 if out_path.split('.')[-1] != 'tiff':
                     if out_path[-1] == '/':
                         file_path = f"{out_path}{request_id}.tiff"
@@ -418,6 +419,8 @@ class SegmentationIOProcessor(IOProcessor):
             raise ValueError("No metadata available for the current task")
         self.meta_data.update(count=1, dtype="uint8", compress="lzw", nodata=0)
 
+        print(request_info)
+      
         if "out_path" in request_info:
             out_data = self.save_geotiff(self._convert_np_uint8(pred_imgs), request_info["meta_data"],
                                 request_info["out_data_format"], request_id, out_path=request_info["out_path"])
