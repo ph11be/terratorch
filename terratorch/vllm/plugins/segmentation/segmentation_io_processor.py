@@ -22,14 +22,15 @@ from vllm.config import VllmConfig
 from vllm.entrypoints.openai.protocol import (IOProcessorRequest,
                                               IOProcessorResponse)
 from vllm.inputs.data import PromptType
+from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
 from vllm.plugins.io_processors.interface import (IOProcessor,
                                                   IOProcessorInput,
                                                   IOProcessorOutput)
 import os
-from .types import RequestData, RequestOutput, PluginConfig, TiledInferenceParameters
+from .types import RequestData, RequestOutput, PluginConfig
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 NO_DATA = -9999
 NO_DATA_FLOAT = 0.0001
@@ -62,9 +63,9 @@ class SegmentationIOProcessor(IOProcessor):
 
         super().__init__(vllm_config)
 
-        self.model_config = vllm_config.model_config.hf_config.to_dict()["pretrained_cfg"]
+        model_config = vllm_config.model_config.hf_config.to_dict()["pretrained_cfg"]
 
-        if not "data" in self.model_config:
+        if not "data" in model_config:
             raise ValueError("The model config does not contain the "
                              "Terratorch datamodule configuration")
 
@@ -72,36 +73,46 @@ class SegmentationIOProcessor(IOProcessor):
 
         self.plugin_config = PluginConfig.model_validate_json(plugin_config_string)
 
-        self.datamodule = generate_datamodule(self.model_config["data"])
+        self.datamodule = generate_datamodule(model_config["data"])
         
-        self.tiled_inference_parameters = self._init_tiled_inference_parameters_info() 
+        self.img_size = 512
         self.batch_size = 1
         self.requests_cache: dict[str, dict[str, Any]] = {}
 
-    def _init_tiled_inference_parameters_info(self) -> TiledInferenceParameters:
-        if "tiled_inference_paramters" in self.model_config["model"]["init_args"]:
-            tiled_inf_param_dict = self.model_config["model"]["init_args"]["tiled_inference_paramters"]
-        else:
-            tiled_inf_param_dict = {}
-        
-        return TiledInferenceParameters(**tiled_inf_param_dict)
-
     def save_geotiff(self, image: torch.Tensor, meta: dict,
-                 out_format: str, request_id: str = None) -> str | bytes:
+                 out_format: str, request_id: str = None, out_path: str = None, out_url: str = None) -> str | bytes:
         """Save multi-band image in Geotiff file.
 
         Args:
             image: np.ndarray with shape (bands, height, width)
             output_path: path where to save the image
+            out_format: output format. One of "path", "b64_json", "url".
+            request_id: request id to use for naming the file if output_path is not provided.
+            out_path: full path or directory where to save the file if out_format is "path".
+            out_url: pre-signed url if out_format is "url".
             meta: dict with meta info.
         """
         if out_format == "path":
-            # create temp file
-            if request_id:
-               fname = f"{request_id}.tiff"
+
+            if out_path:
+                if out_path.split('.')[-1] != 'tiff':
+                    if out_path[-1] == '/':
+                        file_path = f"{out_path}{request_id}.tiff"
+                    else:
+                        file_path = f"{out_path}/{request_id}.tiff"
+                else:
+                    file_path = out_path                        
+
             else:
-                fname =  f"{str(uuid.uiud4()).tiff}"
-            file_path = os.path.join(self.plugin_config.output_path, fname)
+                # create temp file
+                if request_id:
+                    fname = f"{request_id}.tiff"
+                else:
+                    fname =  f"{str(uuid.uiud4()).tiff}"
+
+                file_path = os.path.join(self.plugin_config.output_path, fname)
+
+            print(f"Out file path {file_path}")
             with rasterio.open(file_path, "w", **meta) as dest:
                 for i in range(image.shape[0]):
                     dest.write(image[i, :, :], i + 1)
@@ -115,7 +126,13 @@ class SegmentationIOProcessor(IOProcessor):
 
                 file_data = tmpfile.read()
                 return base64.b64encode(file_data).decode('utf-8')
-
+            
+        elif out_format == "url":
+            if out_url is None:
+                raise ValueError("out_url must be provided when out_format is 'url'")
+            else:
+                ...
+                
         else:
             raise ValueError("Unknown output format")
 
@@ -281,14 +298,16 @@ class SegmentationIOProcessor(IOProcessor):
             path_type=image_data["data_format"],
         )
 
+        self.meta_data = meta_data[0]
+
         if input_data.mean() > 1:
             input_data = input_data / 10000  # Convert to range 0-1
 
         original_h, original_w = input_data.shape[-2:]
-        pad_h = (self.tiled_inference_parameters.h_crop -
-                 (original_h % self.tiled_inference_parameters.h_crop)) % self.tiled_inference_parameters.h_crop
-        pad_w = (self.tiled_inference_parameters.w_crop -
-                 (original_w % self.tiled_inference_parameters.w_crop)) % self.tiled_inference_parameters.w_crop
+        pad_h = (self.img_size -
+                 (original_h % self.img_size)) % self.img_size
+        pad_w = (self.img_size -
+                 (original_w % self.img_size)) % self.img_size
         input_data = np.pad(
             input_data,
             ((0, 0), (0, 0), (0, 0), (0, pad_h), (0, pad_w)),
@@ -296,18 +315,15 @@ class SegmentationIOProcessor(IOProcessor):
         )
 
         batch = torch.tensor(input_data)
-        windows = (batch.unfold(3, self.tiled_inference_parameters.h_crop,
-                                   self.tiled_inference_parameters.w_crop)
-                        .unfold(4, self.tiled_inference_parameters.h_crop,
-                                   self.tiled_inference_parameters.w_crop)
-        )
-
+        windows = batch.unfold(3, self.img_size,
+                               self.img_size).unfold(4, self.img_size,
+                                                     self.img_size)
         h1, w1 = windows.shape[3:5]
         windows = rearrange(
             windows,
             "b c t h1 w1 h w -> (b h1 w1) c t h w",
-            h=self.tiled_inference_parameters.h_crop,
-            w=self.tiled_inference_parameters.w_crop,
+            h=self.img_size,
+            w=self.img_size,
         )
 
         # if no request_id is passed this means that the plugin is used with vlLM
@@ -320,7 +336,7 @@ class SegmentationIOProcessor(IOProcessor):
             "original_h": original_h,
             "original_w": original_w,
             "h1": h1,
-            "w1": w1,
+            "w1": w1
         }
 
         # Split into batches if number of windows > batch_size
@@ -333,7 +349,7 @@ class SegmentationIOProcessor(IOProcessor):
         else:
             temporal_coords = None
         if location_coords:
-            location_coords = torch.tensor(location_coords[0]).unsqueeze(0).to(torch.float16)
+            location_coords = torch.tensor(location_coords[0]).unsqueeze(0)
         else:
             location_coords = None
 
@@ -342,24 +358,14 @@ class SegmentationIOProcessor(IOProcessor):
             # Apply standardization
             window = self.datamodule.test_transform(
                 image=window.squeeze().numpy().transpose(1, 2, 0))
-            try:
-                window = self.datamodule.aug(window)["image"]
-            except:
-                window["image"] = window["image"][None, :, :, :]
-                window = self.datamodule.aug(window)["image"]
-
-            prompt = {
+            window = self.datamodule.aug(window)["image"]
+            prompts.append({
                 "prompt_token_ids": [1],
                 "multi_modal_data": {
                     "pixel_values": window.to(torch.float16)[0],
-                }
-            }
-
-            # not all models use location coordinates, so we don't bother sending them to vLLM if not needed
-            if "location_coords" in self.model_config["input"]["data"]:
-                prompt["multi_modal_data"]["location_coords"] = location_coords
-
-            prompts.append(prompt)
+                    "location_coords": location_coords.to(torch.float16),
+                },
+            })
 
         return prompts
 
@@ -383,7 +389,7 @@ class SegmentationIOProcessor(IOProcessor):
             y_hat = output.outputs.data.argmax(dim=1)
             pred = torch.nn.functional.interpolate(
                 y_hat.unsqueeze(1).float(),
-                size=self.tiled_inference_parameters.h_crop,
+                size=self.img_size,
                 mode="nearest",
             )
             pred_imgs_list.append(pred)
@@ -394,8 +400,8 @@ class SegmentationIOProcessor(IOProcessor):
         pred_imgs = rearrange(
             pred_imgs,
             "(b h1 w1) c h w -> b c (h1 h) (w1 w)",
-            h=self.tiled_inference_parameters.h_crop,
-            w=self.tiled_inference_parameters.w_crop,
+            h=self.img_size,
+            w=self.img_size,
             b=1,
             c=1,
             h1=request_info["h1"],
@@ -408,9 +414,18 @@ class SegmentationIOProcessor(IOProcessor):
         # Squeeze (batch size 1)
         pred_imgs = pred_imgs[0]
 
-        meta_data = request_info["meta_data"]
-        meta_data.update(count=1, dtype="uint8", compress="lzw", nodata=0)
-        out_data = self.save_geotiff(self._convert_np_uint8(pred_imgs), meta_data,
+        if not self.meta_data:
+            raise ValueError("No metadata available for the current task")
+        self.meta_data.update(count=1, dtype="uint8", compress="lzw", nodata=0)
+
+        if "out_path" in request_info:
+            out_data = self.save_geotiff(self._convert_np_uint8(pred_imgs), request_info["meta_data"],
+                                request_info["out_data_format"], request_id, out_path=request_info["out_path"])
+        elif "out_url" in request_info:
+            out_data = self.save_geotiff(self._convert_np_uint8(pred_imgs), request_info["meta_data"],
+                                request_info["out_data_format"], request_id, out_url=request_info["out_url"])
+        else:
+            out_data = self.save_geotiff(self._convert_np_uint8(pred_imgs), request_info["meta_data"],
                                 request_info["out_data_format"], request_id)
 
         return RequestOutput(data_format=request_info["out_data_format"],
