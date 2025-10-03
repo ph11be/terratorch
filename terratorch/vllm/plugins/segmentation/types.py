@@ -41,10 +41,10 @@ class RequestData(BaseModel):
     Allowed values are: [`b64_json`, `path`, `url`]
     """
 
-    out_data_format: Literal["b64_json", "path"]
+    out_data_format: Literal["b64_json", "path", "url"]
     """
     Data type for the output image.
-    Allowed values are: [`b64_json`, `path`]
+    Allowed values are: [`b64_json`, `path`, `url`]
     """
 
     data: Any
@@ -55,6 +55,16 @@ class RequestData(BaseModel):
     indices: Optional[list[int]] = None
     """
     Indices for bands to be processed in the input file
+    """
+
+    out_path: Optional[str] = None
+    """
+    Output URL for the output image when out_data_format is set to url
+    """
+
+    out_url: Optional[str] = None
+    """
+    Output URL for the output image when out_data_format is set to url
     """
 
 
