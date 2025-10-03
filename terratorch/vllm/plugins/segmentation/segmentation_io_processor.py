@@ -339,6 +339,10 @@ class SegmentationIOProcessor(IOProcessor):
             "h1": h1,
             "w1": w1
         }
+        if image_data["out_path"]:
+            self.requests_cache[request_id]["out_path"] = image_data["out_path"]
+        if image_data["out_url"]:
+            self.requests_cache[request_id]["out_url"] = image_data["out_url"]
 
         # Split into batches if number of windows > batch_size
         num_batches = (windows.shape[0] // self.batch_size
