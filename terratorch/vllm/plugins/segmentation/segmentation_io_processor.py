@@ -96,7 +96,7 @@ class SegmentationIOProcessor(IOProcessor):
             print(f"Outputing to a path")
             if out_path:
                 print(f"Given path: {out_path}")
-                if out_path.split('.')[-1] != 'tiff':
+                if (out_path.split('.')[-1] != 'tiff') or (out_path.split('.')[-1] != 'tif'):
                     if out_path[-1] == '/':
                         file_path = f"{out_path}{request_id}.tiff"
                     else:
